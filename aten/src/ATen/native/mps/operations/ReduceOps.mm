@@ -859,6 +859,20 @@ static void argmax_argmin_out_mps(const Tensor& input_t,
         argreduceOutTensor = [mpsGraph reductionArgMinimumWithTensor:castInputTensor axis:(NSInteger)dim_ name:nil];
       }
 
+      // MPSGraph's argmax/argmin ignore NaN. CPU returns the index of the first NaN
+      // (NaN propagates through max/min). Detect NaNs and override the result.
+      if (isFloatingType(inputScalarType)) {
+        MPSGraphTensor* nanMask = [mpsGraph isNaNWithTensor:castInputTensor name:@"is_nan"];
+        MPSGraphTensor* nanCast = [mpsGraph castTensor:nanMask toType:MPSDataTypeInt32 name:@"nan_to_int"];
+        MPSGraphTensor* nanIdx = [mpsGraph reductionArgMaximumWithTensor:nanCast axis:(NSInteger)dim_ name:@"nan_idx"];
+        MPSGraphTensor* hasNan = [mpsGraph reductionMaximumWithTensor:nanCast axis:(NSInteger)dim_ name:@"has_nan"];
+        MPSGraphTensor* hasNanBool = [mpsGraph castTensor:hasNan toType:MPSDataTypeBool name:@"has_nan_bool"];
+        argreduceOutTensor = [mpsGraph selectWithPredicateTensor:hasNanBool
+                                              truePredicateTensor:nanIdx
+                                             falsePredicateTensor:argreduceOutTensor
+                                                             name:@"select_nan_idx"];
+      }
+
       MPSGraphTensor* outputTensor = argreduceOutTensor;
       if (getMPSDataType(output_t) != [argreduceOutTensor dataType]) {
         outputTensor = castMPSTensor(mpsGraph, argreduceOutTensor, output_t.scalar_type());
