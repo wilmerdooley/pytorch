@@ -453,7 +453,7 @@ def _add_nv_gemm_choices_impl(
     _ensure_fp4_dtype_registered()
 
     from torch._inductor.codegen.nv_universal_gemm.kernel_cache import (
-        get_compatible_kernels,
+        partition_compatible_kernels,
     )
 
     # Create dummy tensors for cutlass_api's supports() checks.
@@ -504,6 +504,9 @@ def _add_nv_gemm_choices_impl(
         return
     cc_int = int(cc)
 
+    # Single-pass partition over the ~390K-entry kernel cache. The two-pass
+    # form below called `kernel.supports(args)` once per bucket -- i.e. twice
+    # per non-EFC-class kernel -- across the full cache.
     def _classify(metadata) -> int:
         if _include_efc_kernels_only(metadata):
             return 1  # efc bucket (with tile_M >= 128)
