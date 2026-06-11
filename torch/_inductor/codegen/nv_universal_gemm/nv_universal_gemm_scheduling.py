@@ -513,7 +513,12 @@ class NVUniversalGemmScheduling(BaseScheduling):
         if only_gen_src_code:
             return src_code
 
-        precompile_metadata = self._build_precompile_metadata(kernel, ctb)
+        # Precompile only base (non-EFC) kernels. EFC kernels produce
+        # closure-wrapped artifacts that can't be serialized to disk cache.
+        if epilogue_nodes:
+            precompile_metadata = None
+        else:
+            precompile_metadata = self._build_precompile_metadata(kernel, ctb)
 
         with V.set_kernel_handler(kernel):
             node_schedule: list[BaseSchedulerNode] = [template_node]
@@ -533,8 +538,9 @@ class NVUniversalGemmScheduling(BaseScheduling):
     def _build_precompile_metadata(self, kernel, ctb):
         """Extract shapes and dtypes from kernel inputs/output for subprocess precompilation.
 
-        Returns None if shapes are symbolic (dynamic shapes), in which case the
-        subprocess will skip precompilation and the kernel compiles lazily on first call.
+        Only called for base (non-epilogue) kernels. Returns None if shapes are
+        symbolic (dynamic shapes), in which case the subprocess will skip
+        precompilation and the kernel compiles lazily on first call.
         """
         if not hasattr(kernel, "_template_input_args"):
             return None
@@ -553,26 +559,10 @@ class NVUniversalGemmScheduling(BaseScheduling):
                     input_node.get_dtype()
                 ).removeprefix("torch.")
 
-            if epilogue_nodes:
-                final_node = cast(SchedulerNode, epilogue_nodes[-1])
-                out_layout = cast(
-                    Layout,
-                    final_node.node.get_layout(),  # pyrefly: ignore [missing-attribute]
-                )
-            else:
-                out_layout = cast(Layout, ctb.layout)
+            out_layout = cast(Layout, ctb.layout)
             precompile_shapes["output"] = [int(s) for s in out_layout.size]
             precompile_strides["output"] = [int(s) for s in out_layout.stride]
             precompile_dtypes["output"] = str(out_layout.dtype).removeprefix("torch.")
-
-            if epilogue_reads:
-                for read_name in epilogue_reads:
-                    buf = V.graph.get_buffer(read_name)
-                    precompile_shapes[read_name] = [int(s) for s in buf.get_size()]
-                    precompile_strides[read_name] = [int(s) for s in buf.get_stride()]
-                    precompile_dtypes[read_name] = str(buf.get_dtype()).removeprefix(
-                        "torch."
-                    )
         except (TypeError, RuntimeError, ValueError):
             log.debug(
                 "Skipping NV Universal GEMM precompile metadata: symbolic sizes "
@@ -591,8 +581,8 @@ class NVUniversalGemmScheduling(BaseScheduling):
 
         max_active_clusters = None
         kernel_name = ctb.kernel_metadata.get("kernel_name")
-        if kernel_name and torch.cuda.is_available():
-            try:
+        try:
+            if kernel_name and torch.cuda.is_available():
                 from torch._inductor.codegen.nv_universal_gemm.kernel_cache import (
                     get_kernel_by_name,
                 )
@@ -606,8 +596,10 @@ class NVUniversalGemmScheduling(BaseScheduling):
                     max_active_clusters = get_max_active_clusters(
                         k.impl.cluster_shape_mn
                     )
-            except Exception:
-                log.debug("Could not extract max_active_clusters for precompile")
+        except Exception:
+            log.debug(
+                "Failed to resolve max_active_clusters for precompile", exc_info=True
+            )
 
         return {
             "precompile_shapes": precompile_shapes,
