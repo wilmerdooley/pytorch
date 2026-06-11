@@ -4695,6 +4695,150 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
 
     @supported_platform
     @skip_on_cpu
+    @skip_on_mps
+    def test_chunked_unbacked_flex_attention_symbolic_batch_and_seq(self, device):
+        from torch._dynamo.decorators import mark_unbacked
+        from torch._inductor.kernel.flex import flex_attention as flex_kernel_mod
+
+        B, H, S, D, MAX_S = 4, 2, 64, 64, 128
+        dtype = torch.float16
+        stride = (H * MAX_S * D, MAX_S * D, D, 1)
+
+        def make_pair():
+            base = torch.empty_strided((B, H, S, D), stride, device=device, dtype=dtype)
+            base.normal_()
+            ref = base.detach().clone().requires_grad_(True)
+            traced = base.detach().clone().requires_grad_(True)
+            mark_unbacked(traced, 0, hint_override=B, shape_id="batch", min=2, max=B)
+            mark_unbacked(traced, 2, hint_override=S, shape_id="seq", min=1, max=MAX_S)
+            return ref, traced
+
+        def causal_mask(_b, _h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        block_mask = create_block_mask(
+            causal_mask, B=None, H=None, Q_LEN=S, KV_LEN=S, device=device
+        )
+
+        def chunked_attention(q, k, v):
+            mid = q.shape[0] // 2
+            return (
+                flex_attention(q[:mid], k[:mid], v[:mid], block_mask=block_mask).sum()
+                + flex_attention(q[mid:], k[mid:], v[mid:], block_mask=block_mask).sum()
+            )
+
+        q_ref, q = make_pair()
+        k_ref, k = make_pair()
+        v_ref, v = make_pair()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            ref_loss = chunked_attention(q_ref, k_ref, v_ref)
+        ref_loss.backward()
+
+        compiled_chunked_attention = torch.compile(
+            chunked_attention, dynamic=True, fullgraph=True
+        )
+        with mock.patch.object(
+            flex_kernel_mod,
+            "create_flex_decoding_kernel",
+            wraps=flex_kernel_mod.create_flex_decoding_kernel,
+        ) as decode_kernel:
+            compiled_loss, code = run_and_get_code(compiled_chunked_attention, q, k, v)
+            self.assertFalse(
+                decode_kernel.called,
+                "Symbolic decode predicates should fall back to flex attention.",
+            )
+        compiled_loss.backward()
+
+        source = "\n".join(code)
+        self.assertIn("slice_1_size_0 = slice_1_size[0]", source)
+        self.assertIn("slice_4_size_0 = slice_4_size[0]", source)
+        self.assertIn("assert_size_stride(slice_1, (slice_1_size_0", source)
+        self.assertIn("assert_size_stride(slice_4, (slice_4_size_0", source)
+
+        self.assertEqual(compiled_loss, ref_loss, atol=1e-1, rtol=1e-2)
+        self.assertEqual(q.grad, q_ref.grad, atol=5e-3, rtol=5e-2)
+        self.assertEqual(k.grad, k_ref.grad, atol=5e-3, rtol=5e-2)
+        self.assertEqual(v.grad, v_ref.grad, atol=5e-3, rtol=5e-2)
+
+    @supported_platform
+    @skip_on_cpu
+    @skip_on_mps
+    def test_unbacked_flex_attention_symbolic_block_mask_lengths(self, device):
+        from torch._dynamo.decorators import mark_unbacked
+        from torch._inductor.kernel.flex import flex_attention as flex_kernel_mod
+
+        B, H, S, D, MAX_S = 2, 2, 64, 64, 512
+        dtype = torch.float16
+        stride = (H * MAX_S * D, MAX_S * D, D, 1)
+
+        def make_pair():
+            base = torch.empty_strided((B, H, S, D), stride, device=device, dtype=dtype)
+            base.normal_()
+            ref = base.detach().clone()
+            traced = base.detach().clone()
+            mark_unbacked(traced, 2, hint_override=S, shape_id="seq", min=2, max=MAX_S)
+            return ref, traced
+
+        def make_block_mask_inputs():
+            kv_num_blocks = torch.ones((1, 1, 1), device=device, dtype=torch.int32)
+            kv_indices = torch.zeros((1, 1, 1, 1), device=device, dtype=torch.int32)
+            q_num_blocks = torch.ones((1, 1, 1), device=device, dtype=torch.int32)
+            q_indices = torch.zeros((1, 1, 1, 1), device=device, dtype=torch.int32)
+            return kv_num_blocks, kv_indices, q_num_blocks, q_indices
+
+        def attention_with_symbolic_block_mask(q, k, v, kv_nb, kv_idx, q_nb, q_idx):
+            mid = q.shape[2] // 2
+            block_mask = BlockMask(
+                seq_lengths=(mid, k.shape[2]),
+                kv_num_blocks=kv_nb,
+                kv_indices=kv_idx,
+                full_kv_num_blocks=None,
+                full_kv_indices=None,
+                q_num_blocks=q_nb,
+                q_indices=q_idx,
+                full_q_num_blocks=None,
+                full_q_indices=None,
+                BLOCK_SIZE=(128, 128),
+                mask_mod=noop_mask,
+            )
+            return flex_attention(q[:, :, :mid, :], k, v, block_mask=block_mask).sum()
+
+        q_ref, q = make_pair()
+        k_ref, k = make_pair()
+        v_ref, v = make_pair()
+        block_mask_inputs = make_block_mask_inputs()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            ref_loss = attention_with_symbolic_block_mask(
+                q_ref, k_ref, v_ref, *block_mask_inputs
+            )
+
+        compiled_attention = torch.compile(
+            attention_with_symbolic_block_mask, dynamic=True, fullgraph=True
+        )
+        with mock.patch.object(
+            flex_kernel_mod,
+            "create_flex_decoding_kernel",
+            wraps=flex_kernel_mod.create_flex_decoding_kernel,
+        ) as decode_kernel:
+            compiled_loss, code = run_and_get_code(
+                compiled_attention, q, k, v, *block_mask_inputs
+            )
+            self.assertFalse(
+                decode_kernel.called,
+                "Unproven symbolic decode predicates should use flex attention.",
+            )
+
+        source = "\n".join(code)
+        self.assertIn("Min(u0, (u0//2))", source)
+        FileCheck().check("flex_attention").check_not("flex_decoding").run(source)
+        self.assertEqual(compiled_loss, ref_loss, atol=1e-1, rtol=1e-2)
+
+    @supported_platform
+    @skip_on_cpu
     @skip_on_mps  # asserts Triton-specific BACKEND='TRITON_DECODE' error
     def test_backend_triton_decode_errors_when_not_supported(self, device):
         """Requesting decode on unsupported shapes should raise a helpful error."""
@@ -7324,11 +7468,15 @@ BlockMask(shape=(1,s1,s2048,s2048),ssparsity=46.88%,s
 
         block_mask = create_block_mask(mask_mod, None, None, 1024, 1024, device=device)
         flex_attention_call(*create_inputs(1024), block_mask=block_mask)
-        with self.assertRaisesRegex(ValueError, "block_mask was created for"):
+        with self.assertRaisesRegex(
+            (ValueError, RuntimeError), "block_mask was created for"
+        ):
             flex_attention_call(*create_inputs(2048), block_mask=block_mask)
 
         block_mask = create_block_mask(mask_mod, None, None, 1023, 1023, device=device)
-        with self.assertRaisesRegex(ValueError, "block_mask was created for"):
+        with self.assertRaisesRegex(
+            (ValueError, RuntimeError), "block_mask was created for"
+        ):
             flex_attention_call(*create_inputs(1024), block_mask=block_mask)
 
     @supported_platform
