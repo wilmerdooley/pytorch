@@ -4669,7 +4669,6 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
     @unittest.skipIf(not has_triton_package(), "requires triton")
     def test_capture_triton_backend_options_exclude_kernel_args(self):
         import triton
-        import triton.language as tl
 
         @triton.jit
         def add_kernel(
@@ -4720,9 +4719,63 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
         )
 
     @unittest.skipIf(not has_triton_package(), "requires triton")
+    def test_capture_triton_autotune_config_does_not_materialize_default_args(self):
+        import triton
+
+        @triton.autotune(
+            configs=[triton.Config({"BLOCK_SIZE": 16}, num_warps=4)],
+            key=[],
+        )
+        @triton.jit
+        def add_kernel(
+            in_ptr0,
+            out_ptr,
+            n_elements,
+            BLOCK_SIZE: "tl.constexpr" = 2,
+        ):
+            pass
+
+        def f(x):
+            output = torch.empty_like(x)
+            n_elements = output.numel()
+            grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+            capture_triton(add_kernel)[grid](
+                in_ptr0=x,
+                out_ptr=output,
+                n_elements=n_elements,
+            )
+            return output
+
+        from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        gm = make_fx(f)(torch.randn(4))
+        hop_node = next(
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is triton_kernel_wrapper_mutation
+        )
+
+        # Omitted Python defaults should stay omitted from the HOP payload.
+        # The autotune config still provides BLOCK_SIZE to grid(meta), giving a
+        # single-program grid for four elements. This prevents the default
+        # BLOCK_SIZE=2 from being recorded as an explicit constant argument and
+        # competing with the config's BLOCK_SIZE=16 downstream.
+        constant_args = kernel_side_table.get_constant_args(
+            hop_node.kwargs["constant_args_idx"]
+        )
+        self.assertEqual(
+            set(hop_node.kwargs["kwargs"]), {"in_ptr0", "out_ptr", "n_elements"}
+        )
+        self.assertNotIn("BLOCK_SIZE", hop_node.kwargs["kwargs"])
+        self.assertNotIn("BLOCK_SIZE", constant_args)
+        self.assertEqual(hop_node.kwargs["grid"], [(1, 1, 1)])
+        self.assertEqual(hop_node.kwargs["backend_options"], {})
+
+    @unittest.skipIf(not has_triton_package(), "requires triton")
     def test_capture_triton_dynamic_backend_options_error(self):
         import triton
-        import triton.language as tl
 
         @triton.jit
         def add_kernel(
@@ -4742,15 +4795,15 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
                 out_ptr=output,
                 n_elements=n_elements,
                 BLOCK_SIZE=16,
-                grid_launch_partition=(n_elements,),
+                maxnreg=n_elements,
             )
             return output
 
         from torch.fx.experimental.proxy_tensor import make_fx
 
-        # Unlike n_elements above, grid_launch_partition is not a kernel
-        # parameter. If it contains a symbolic value, it cannot be represented
-        # as a concrete compile-time backend option.
+        # Unlike n_elements above, maxnreg is not a kernel parameter. If it
+        # contains a symbolic value, it cannot be represented as a concrete
+        # compile-time backend option.
         with self.assertRaisesRegex(
             RuntimeError, "Triton backend options must be concrete values"
         ):
