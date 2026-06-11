@@ -15626,6 +15626,82 @@ class TestFusedRMSNormOverrideRouting(TestCase):
         self.assertFalse(w.is_contiguous())
         self.assertFalse(_fused_rms_norm_cond(x, [128], w, 1e-5))
 
+    @parametrize_test("dtype", [torch.float16, torch.bfloat16])
+    @parametrize_test("N", [63, 127, 129, 255])
+    def test_fwd_cond_false_on_unvectorizable_N_16bit(self, dtype, N):
+        # For 16-bit dtypes an odd N gives vecsize=gcd(N, 8)=1, so quack lowers
+        # the gmem->smem copy to a 16-bit cp.async whose cp_size is rejected by
+        # CuTe IR verification at compile time. cond must fall through to aten.
+        from torch._native.ops.norm.rmsnorm_impl import _fused_rms_norm_cond
+
+        x = torch.randn(8, N, dtype=dtype, device="cuda")
+        w = torch.randn(N, dtype=dtype, device="cuda")
+        self.assertFalse(_fused_rms_norm_cond(x, [N], w, 1e-5))
+
+    @parametrize_test("dtype", [torch.float16, torch.bfloat16])
+    @parametrize_test("N", [63, 127, 129, 255])
+    def test_bwd_cond_false_on_unvectorizable_N_16bit(self, dtype, N):
+        from torch._native.ops.norm.rmsnorm_impl import _fused_rms_norm_backward_cond
+
+        x = torch.randn(8, N, dtype=dtype, device="cuda")
+        w = torch.randn(N, dtype=dtype, device="cuda")
+        gout = torch.randn(8, N, dtype=dtype, device="cuda")
+        rstd = torch.empty(8, dtype=torch.float32, device="cuda")
+        self.assertFalse(
+            _fused_rms_norm_backward_cond(gout, x, [N], rstd, w, [True, True])
+        )
+
+    def _make_misaligned(self, M, N, dtype):
+        buf = torch.randn(M * N + 1, dtype=dtype, device="cuda")
+        x = buf[1:].view(M, N)
+        self.assertTrue(x.is_contiguous())
+        return x
+
+    def test_fwd_cond_misaligned_input_gated_on_size(self):
+        # A misaligned base pointer forces a clone before quack can run
+        # (norms._reshape_2d). The clone's extra read+write only pays off when
+        # quack's bandwidth advantage absorbs it (>= _MISALIGNED_MIN_NUMEL,
+        # measured on B200); below that the cond falls back to aten.
+        from torch._native.ops.norm.rmsnorm_impl import (
+            _MISALIGNED_MIN_NUMEL,
+            _fused_rms_norm_cond,
+        )
+
+        N = 2048
+        w = torch.randn(N, dtype=torch.bfloat16, device="cuda")
+        small = self._make_misaligned(8, N, torch.bfloat16)
+        self.assertFalse(_fused_rms_norm_cond(small, [N], w, 1e-5))
+        large = self._make_misaligned(_MISALIGNED_MIN_NUMEL // N, N, torch.bfloat16)
+        self.assertTrue(_fused_rms_norm_cond(large, [N], w, 1e-5))
+
+    def test_bwd_cond_misaligned_input_gated_on_size(self):
+        # Same gate as the fwd, checked for both x and grad_out.
+        from torch._native.ops.norm.rmsnorm_impl import (
+            _MISALIGNED_MIN_NUMEL,
+            _fused_rms_norm_backward_cond,
+        )
+
+        N = 2048
+        M = 8
+        w = torch.randn(N, dtype=torch.bfloat16, device="cuda")
+        aligned = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+        misaligned = self._make_misaligned(M, N, torch.bfloat16)
+        rstd = torch.empty(M, dtype=torch.float32, device="cuda")
+        mask = [True, True]
+        self.assertFalse(
+            _fused_rms_norm_backward_cond(aligned, misaligned, [N], rstd, w, mask)
+        )
+        self.assertFalse(
+            _fused_rms_norm_backward_cond(misaligned, aligned, [N], rstd, w, mask)
+        )
+
+        M = _MISALIGNED_MIN_NUMEL // N
+        large = self._make_misaligned(M, N, torch.bfloat16)
+        rstd = torch.empty(M, dtype=torch.float32, device="cuda")
+        self.assertTrue(
+            _fused_rms_norm_backward_cond(large, large, [N], rstd, w, mask)
+        )
+
     @parametrize_test(
         "output_mask",
         [
@@ -15713,6 +15789,29 @@ class TestFusedRMSNormOverrideNumerics(TestCase):
         out, _ = torch.ops.aten._fused_rms_norm(x, [128], w, 1e-5)
         ref = torch.nn.functional.rms_norm(x, [128], w, 1e-5)
         self.assertEqual(out, ref, atol=1e-12, rtol=0)
+
+    @parametrize_test("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    @parametrize_test("offset", [1, 2, 4])
+    def test_misaligned_base_pointer(self, dtype, offset):
+        # A contiguous input sliced off a flat buffer (buf[offset:].view(M, N))
+        # has clean strides but a base pointer that isn't 16B aligned. quack
+        # compiles assuming the vectorized alignment, so the override must
+        # re-materialize an aligned buffer rather than crash with
+        # "Misaligned Tensor data on argument #0". M*N is chosen above
+        # _MISALIGNED_MIN_NUMEL so the cond routes to the clone path rather
+        # than falling back to aten.
+        from torch._native.ops.norm.rmsnorm_impl import _MISALIGNED_MIN_NUMEL
+
+        N = 2048
+        M = _MISALIGNED_MIN_NUMEL // N
+        buf = torch.randn(M * N + offset, dtype=dtype, device="cuda")
+        x = buf[offset:].view(M, N)
+        self.assertTrue(x.is_contiguous())
+        w = torch.randn(N, dtype=dtype, device="cuda")
+        y, _ = torch.ops.aten._fused_rms_norm(x, [N], w, 1e-5)
+        with torch.backends.python_native.operations_disabled("_fused_rms_norm"):
+            y_ref, _ = torch.ops.aten._fused_rms_norm(x, [N], w, 1e-5)
+        self.assertEqual(y, y_ref, atol=1e-1, rtol=0)
 
     # Tolerances picked to match the aten kernel within ~1 ULP of the reduced
     # dtype; the quack kernel uses a different accumulation order.
